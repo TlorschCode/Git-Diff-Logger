@@ -1,0 +1,149 @@
+diff --git a/app/src/main/cpp/clip.cpp b/app/src/main/cpp/clip.cpp
+index 11acf0d..2e06850 100644
+--- a/app/src/main/cpp/clip.cpp
++++ b/app/src/main/cpp/clip.cpp
+@@ -6,9 +6,10 @@
+ #include <algorithm>
+ 
+ #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "NativeAudio", __VA_ARGS__)
+-#define SAMPLE_RATE 44100
+-#define CHANNELS 1
+-#define DURATION_SECONDS 30
++constexpr uint16_t SAMPLE_RATE = 44100;
++constexpr uint8_t CHANNELS = 1;
++constexpr uint8_t DURATION_SECONDS = 30;
++constexpr uint64_t NANOS_PER_SEC = 1000000000ULL;
+ 
+ static std::shared_ptr<oboe::AudioStream> stream;
+ static std::atomic<bool> gRecordingActive{false};
+@@ -17,7 +18,7 @@ static std::atomic<uint64_t> gLastCallbackNs{0};
+ static inline int64_t nowNs() {
+     timespec ts{};
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return (int64_t)ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
++    return (int64_t)ts.tv_sec * NANOS_PER_SEC + ts.tv_nsec;
+ }
+ 
+ class InputCallback : public oboe::AudioStreamCallback {
+@@ -114,7 +115,7 @@ Java_dev_rylry_clip_NativeAudio_isRecordingActive(JNIEnv*, jobject) {
+     uint64_t lastNs = gLastCallbackNs.load(std::memory_order_relaxed);
+ 
+     // No callbacks in the last 2 seconds → dead
+-    constexpr uint64_t TIMEOUT_NS = 2'000'000'000ULL;
++    constexpr uint64_t TIMEOUT_NS = NANOS_PER_SEC * 2;
+ 
+     return (nowNs() - lastNs) < TIMEOUT_NS ? JNI_TRUE : JNI_FALSE;
+ }
+@@ -129,18 +130,18 @@ Java_dev_rylry_clip_NativeAudio_copySnapshot(JNIEnv* env, jobject, jbyteArray ou
+     jbyte* buffer = env->GetByteArrayElements(outArray, nullptr);
+     if (!buffer) return;
+ 
+-    int frames = len / 2; // 2 bytes per frame (mono PCM16)
+-    int write = callback.mWriteIndex.load(std::memory_order_acquire);
++    size_t frames = len / 2; // 2 bytes per frame (mono PCM16)
++    size_t write = callback.mWriteIndex.load(std::memory_order_acquire);
+     int totalSamples = frames; // 1 sample per frame for mono
+ 
+-    int start = write - totalSamples;
++    size_t start = write - totalSamples;
+     if (start < 0) start += callback.mBuffer.size();
+ 
+-    for (int i = 0; i < totalSamples; ++i) {
++    for (size_t i = 0; i < totalSamples; ++i) {
+         int16_t sample = callback.mBuffer[(start + i) % callback.mBuffer.size()];
+         buffer[2*i]     = static_cast<jbyte>(sample & 0xFF);
+         buffer[2*i + 1] = static_cast<jbyte>((sample >> 8) & 0xFF);
+     }
+ 
+     env->ReleaseByteArrayElements(outArray, buffer, 0);
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/java/dev/rylry/clip/RecordingService.kt b/app/src/main/java/dev/rylry/clip/RecordingService.kt
+index 67884b3..2f2b696 100644
+--- a/app/src/main/java/dev/rylry/clip/RecordingService.kt
++++ b/app/src/main/java/dev/rylry/clip/RecordingService.kt
+@@ -29,6 +29,8 @@ import java.io.File
+ import java.io.FileInputStream
+ import kotlin.math.min
+ 
++private const val TIMEOUT_MCRS = 10000
++
+ class RecordingService : Service() {
+     private val binder = AudioServiceBinder()
+ 
+@@ -147,20 +149,23 @@ class RecordingService : Service() {
+         val clipTime = System.currentTimeMillis()
+         val outputFile = File(filesDir, "cache.m4a")
+ 
+-        // Fetch raw PCM from JNI layer
+-        val buffer = ByteArray(44100 * 30 * 2)
+-        NativeAudio.copySnapshot(buffer)
+-
+         val sampleRate = 44100
++        val sampleLength = 30
++        val bytesPerSample = 2
+         val channelCount = 1
+         val bitRate = 128_000
++        val maxCodecInputBytes = 16 * 1024 // 16384
++
++        // Fetch raw PCM from JNI layer
++        val buffer = ByteArray(sampleRate * sampleLength * bytesPerSample)
++        NativeAudio.copySnapshot(buffer)
+ 
+         val format = MediaFormat.createAudioFormat(
+             MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount
+         ).apply {
+             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
++            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxCodecInputBytes)
+         }
+ 
+         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+@@ -175,19 +180,19 @@ class RecordingService : Service() {
+         var pcmOffset = 0
+ 
+         while (pcmOffset < buffer.size) {
+-            val inputIndex = encoder.dequeueInputBuffer(10000)
++            val inputIndex = encoder.dequeueInputBuffer(TIMEOUT_MCRS)
+             if (inputIndex >= 0) {
+                 val inputBuffer = encoder.getInputBuffer(inputIndex)!!
+                 inputBuffer.clear()
+                 val bytesToWrite = min(inputBuffer.capacity(), buffer.size - pcmOffset)
+                 inputBuffer.put(buffer, pcmOffset, bytesToWrite)
+ 
+-                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (sampleRate * 2 * channelCount)
++                val presentationTimeUs = (pcmOffset.toLong() * 1_000_000L) / (sampleRate * 2 * channelCount) // 1,000,000 to convert microseconds to seconds
+                 encoder.queueInputBuffer(inputIndex, 0, bytesToWrite, presentationTimeUs, 0)
+                 pcmOffset += bytesToWrite
+             }
+ 
+-            var outputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
++            var outputIndex = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_MCRS)
+             while (outputIndex >= 0) {
+                 val encodedData = encoder.getOutputBuffer(outputIndex)!!
+                 if (!muxerStarted) {
+@@ -202,13 +207,13 @@ class RecordingService : Service() {
+         }
+ 
+         // Signal EOS
+-        val finalInputIndex = encoder.dequeueInputBuffer(10000)
++        val finalInputIndex = encoder.dequeueInputBuffer(TIMEOUT_MCRS)
+         if (finalInputIndex >= 0) {
+             encoder.queueInputBuffer(finalInputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+         }
+ 
+         // Drain remaining output
+-        var finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, 10000)
++        var finalOutputIndex = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_MCRS)
+         while (finalOutputIndex >= 0) {
+             val encodedData = encoder.getOutputBuffer(finalOutputIndex)!!
+             muxer.writeSampleData(muxerTrackIndex, encodedData, bufferInfo)
+@@ -248,4 +253,4 @@ class RecordingService : Service() {
+             }
+         }
+     }
+-}
+\ No newline at end of file
++}
